@@ -1,70 +1,78 @@
 #!/bin/bash
-# Nextcloud 28 Full Install (Shell Only)
-# GitHub-ready version
-# Run as root
-set -euo pipefail
+# ==========================
+# Proxmox + Ubuntu 22.04 + Nextcloud Auto Install
+# ==========================
 
-# -------------------------
-# Variables (ubah sesuai kebutuhan)
-# -------------------------
+# CONFIG
+VMID=110                     # ID VM, sesuaikan jika perlu
+VM_NAME="nextcloud"
+ISO_PATH="local:iso/ubuntu-22.04-live-server-amd64.iso"
+BRIDGE="vmbr0"
+IP_ADDR="192.168.100.15/24"
+GATEWAY="192.168.100.2"
+DNS="192.168.100.2"
+RAM=4096
+CPU=2
+DISK=40G
+PASSWORD="st412wow"      # root password Ubuntu
 DB_NAME="nextcloud"
 DB_USER="localhost"
-DB_PASS="localhost"
-NEXTCLOUD_VERSION="28.0.11"
-NEXTCLOUD_INSTANCEID="ocbhz1odqwyk"
-TRUSTED_IP="192.168.100.15"
-TRUSTED_DOMAIN="nextcloud.ubm.co.id"
+DB_PASSWORD="localhost"
+TRUSTED_DOMAINS=("192.168.100.15" "nextcloud.ubm.co.id")
 
-# -------------------------
-# 1️⃣ Update & install basics
-# -------------------------
-apt update && apt upgrade -y
-apt install -y sudo curl wget gnupg lsb-release unzip ufw software-properties-common
+# ==========================
+# 1. Create VM
+# ==========================
+qm create $VMID --name $VM_NAME --memory $RAM --cores $CPU --net0 virtio,bridge=$BRIDGE \
+  --ostype l26 --bootdisk scsi0 --scsihw virtio-scsi-pci --ide2 $ISO_PATH,media=cdrom \
+  --serial0 socket --vga serial0 --agent 1
 
-# -------------------------
-# 2️⃣ Install NGINX, PHP, MariaDB
-# -------------------------
-apt install -y nginx mariadb-server mariadb-client \
-php8.2-fpm php8.2-mysql php8.2-gd php8.2-curl php8.2-mbstring php8.2-intl \
-php8.2-bcmath php8.2-zip php8.2-imagick php8.2-xml php8.2-gmp php8.2-apcu php8.2-redis
+qm set $VMID --scsi0 local-lvm:$DISK
 
-systemctl enable --now nginx
-systemctl enable --now php8.2-fpm
-systemctl enable --now mariadb
+echo "VM $VM_NAME with ID $VMID created. Start the VM and continue installation manually via console."
+echo "Ubuntu root password will be set to $PASSWORD"
 
-# -------------------------
-# 3️⃣ Setup MariaDB
-# -------------------------
-mysql -u root <<MYSQL_SCRIPT
-CREATE DATABASE IF NOT EXISTS $DB_NAME;
-CREATE USER IF NOT EXISTS '$DB_USER'@'%' IDENTIFIED BY '$DB_PASS';
-GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'%';
-FLUSH PRIVILEGES;
-EXIT;
-MYSQL_SCRIPT
+# ==========================
+# 2. Instructions for user
+# ==========================
+echo "Please complete Ubuntu 22.04 installation via Proxmox console:"
+echo "- Set root password: $PASSWORD"
+echo "- Configure static IP: $IP_ADDR with gateway $GATEWAY and DNS $DNS"
+echo "- Install OpenSSH server"
 
-sed -i "s/^bind-address.*/bind-address = 0.0.0.0/" /etc/mysql/mariadb.conf.d/50-server.cnf
-systemctl restart mariadb
+echo "After OS installation and reboot, run the following commands inside the VM to install Nextcloud:"
 
-# -------------------------
-# 4️⃣ Download & setup Nextcloud
-# -------------------------
-cd /var/www
-wget https://download.nextcloud.com/server/releases/nextcloud-${NEXTCLOUD_VERSION}.zip
-unzip nextcloud-${NEXTCLOUD_VERSION}.zip
-chown -R www-data:www-data nextcloud
-chmod -R 750 nextcloud
+cat <<'EOF'
 
-mkdir -p /var/www/nextcloud/data /var/www/nextcloud/apps
-chown -R www-data:www-data /var/www/nextcloud/data /var/www/nextcloud/apps
+# ==========================
+# INSIDE THE VM
+# ==========================
 
-# -------------------------
-# 5️⃣ Setup NGINX server block
-# -------------------------
-cat >/etc/nginx/sites-available/nextcloud <<EOF
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install packages
+sudo apt install -y nginx mariadb-server php8.2-fpm php8.2-mysql php8.2-gd php8.2-curl php8.2-mbstring \
+php8.2-intl php8.2-bcmath php8.2-gmp php8.2-xml php8.2-zip unzip wget curl
+
+# Setup MariaDB
+sudo mysql -e "CREATE DATABASE nextcloud;"
+sudo mysql -e "CREATE USER 'localhost'@'%' IDENTIFIED BY 'localhost';"
+sudo mysql -e "GRANT ALL PRIVILEGES ON nextcloud.* TO 'localhost'@'%';"
+sudo mysql -e "FLUSH PRIVILEGES;"
+
+# Download Nextcloud
+cd /var/www/
+sudo wget https://download.nextcloud.com/server/releases/nextcloud-28.0.11.zip
+sudo unzip nextcloud-28.0.11.zip
+sudo chown -R www-data:www-data nextcloud
+sudo chmod -R 750 nextcloud
+
+# Nginx configuration
+sudo tee /etc/nginx/sites-available/nextcloud > /dev/null <<'NGXCONF'
 server {
     listen 80;
-    server_name $TRUSTED_IP $TRUSTED_DOMAIN;
+    server_name _;
 
     root /var/www/nextcloud;
     index index.php index.html;
@@ -77,62 +85,64 @@ server {
     real_ip_recursive on;
 
     location / {
-        try_files \$uri \$uri/ /index.php\$request_uri;
+        try_files $uri $uri/ /index.php$request_uri;
     }
 
-    location ~ \.php\$ {
+    location ~ \.php$ {
         include snippets/fastcgi-php.conf;
+        fastcgi_param HTTPS on;
+        fastcgi_param HTTP_X_FORWARDED_PROTO https;
         fastcgi_pass unix:/run/php/php8.2-fpm.sock;
-        fastcgi_param HTTPS off;
-        fastcgi_read_timeout 360;
     }
 
     location ~ /\.(?!well-known).* {
         deny all;
     }
 }
+NGXCONF
+
+sudo ln -s /etc/nginx/sites-available/nextcloud /etc/nginx/sites-enabled/
+sudo rm /etc/nginx/sites-enabled/default
+sudo systemctl restart nginx
+sudo systemctl enable nginx
+sudo systemctl restart php8.2-fpm
+sudo systemctl enable php8.2-fpm
+
+# Setup Nextcloud config.php
+sudo tee /var/www/nextcloud/config/config.php > /dev/null <<CONFIG
+<?php
+\$CONFIG = array (
+  'trusted_domains' => array (
 EOF
 
-ln -sf /etc/nginx/sites-available/nextcloud /etc/nginx/sites-enabled/
-nginx -t
-systemctl reload nginx
+for domain in "${TRUSTED_DOMAINS[@]}"; do
+    echo "    0 => '$domain'," | sudo tee -a /var/www/nextcloud/config/config.php
+done
 
-# -------------------------
-# 6️⃣ PHP-FPM tuning
-# -------------------------
-PHP_POOL="/etc/php/8.2/fpm/pool.d/www.conf"
-sed -i "s/^;pm.max_children.*/pm.max_children = 50/" $PHP_POOL
-sed -i "s/^;pm.start_servers.*/pm.start_servers = 5/" $PHP_POOL
-sed -i "s/^;pm.min_spare_servers.*/pm.min_spare_servers = 5/" $PHP_POOL
-sed -i "s/^;pm.max_spare_servers.*/pm.max_spare_servers = 35/" $PHP_POOL
-sed -i "s/^;request_terminate_timeout.*/request_terminate_timeout = 360/" $PHP_POOL
-systemctl restart php8.2-fpm
+cat <<'CONFIG'
+  ),
+  'datadirectory' => '/var/www/nextcloud/data',
+  'dbtype' => 'mysql',
+  'version' => '28.0.11.1',
+  'instanceid' => 'ocbhz1odqwyk',
+  'passwordsalt' => 'nxr51Dq8wcU8iajUx6HMxm2pooYf/j',
+  'secret' => 'jVD1pTsiOoUzifqXpukCgPhrSKit8qG//B1VdkcdxnfJlY/2',
+  'overwrite.cli.url' => 'https://192.168.100.15',
+  'dbname' => 'nextcloud',
+  'dbhost' => 'localhost',
+  'dbport' => '',
+  'dbtableprefix' => 'oc_',
+  'mysql.utf8mb4' => true,
+  'dbuser' => 'localhost',
+  'dbpassword' => 'localhost',
+  'installed' => true,
+);
+CONFIG
 
-PHP_INI="/etc/php/8.2/fpm/php.ini"
-sed -i "s/^upload_max_filesize.*/upload_max_filesize = 512M/" $PHP_INI
-sed -i "s/^post_max_size.*/post_max_size = 512M/" $PHP_INI
-sed -i "s/^memory_limit.*/memory_limit = 512M/" $PHP_INI
-sed -i "s/^max_execution_time.*/max_execution_time = 360/" $PHP_INI
-systemctl restart php8.2-fpm
+sudo chown -R www-data:www-data /var/www/nextcloud
+sudo chmod -R 750 /var/www/nextcloud
 
-# -------------------------
-# 7️⃣ Setup Nextcloud config.php
-# -------------------------
-cp config/nextcloud-config.php.template /var/www/nextcloud/config/config.php
-sed -i "s|__TRUSTED_IP__|$TRUSTED_IP|g" /var/www/nextcloud/config/config.php
-sed -i "s|__TRUSTED_DOMAIN__|$TRUSTED_DOMAIN|g" /var/www/nextcloud/config/config.php
-sed -i "s|__DB_NAME__|$DB_NAME|g" /var/www/nextcloud/config/config.php
-sed -i "s|__DB_USER__|$DB_USER|g" /var/www/nextcloud/config/config.php
-sed -i "s|__DB_PASS__|$DB_PASS|g" /var/www/nextcloud/config/config.php
-chown -R www-data:www-data /var/www/nextcloud
+echo "Nextcloud installation completed. Access via http://192.168.100.15"
 
-# -------------------------
-# 8️⃣ Firewall
-# -------------------------
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw --force enable
+EOF
 
-echo "✅ Nextcloud 28 GitHub-ready install selesai!"
-echo "Akses via IP: http://$TRUSTED_IP"
